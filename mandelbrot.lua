@@ -8,11 +8,17 @@
 --
 -- Performance stack:
 --   1. Cardioid/period-2 bulb pre-check — skips iteration for provably in-set points
---   2. Incremental coordinate stepping  — 2 adds per cell instead of 4 muls
+--   2. Direct column coordinates        — multiply per cell, no float drift at deep zoom
 --   3. Two-phase Brent cycle detection  — interior exits early, exterior exits fast
 --   4. Precomputed braille strings      — zero hot-path allocation (30×256 at init)
+--   5. Reused row buffer               — no per-row table allocation; less GC pressure
 
 local p = plugin.register({ name = "Mandelbrot", type = "visualizer" })
+
+-- Cache globals: local lookups skip the global table chain in Lua 5.1's VM.
+local m_min   = math.min
+local m_max   = math.max
+local m_floor = math.floor
 
 -- ── Zoom targets — cycles to next when screen goes solid ─────────────────────
 local TARGETS = {
@@ -105,6 +111,7 @@ function p:init()
     self.center_x      = TARGETS[1].x
     self.center_y      = TARGETS[1].y
     self.resetting     = false
+    self.row_buffer    = {}   -- reused every frame to avoid per-row allocation
 end
 
 function p:render(bands, frame, rows, cols)
@@ -129,7 +136,7 @@ function p:render(bands, frame, rows, cols)
             local factor = 1.0 - RESET_SPEED * dt
             if factor < 0.1 then factor = 0.1 end
             self.zoom     = (self.zoom or 1) * factor
-            self.zoom_log = math.max(0, (self.zoom_log or 0) - RESET_SPEED * dt)
+            self.zoom_log = m_max(0, (self.zoom_log or 0) - RESET_SPEED * dt)
             if self.zoom <= MIN_ZOOM then
                 self.zoom = MIN_ZOOM; self.zoom_log = 0
                 self.resetting = false; self.zoom_dir = 1
@@ -141,7 +148,7 @@ function p:render(bands, frame, rows, cols)
             local zd  = self.zoom_dir or 1
             local dzl = ZOOM_SPEED * dt * zd
             self.zoom     = (self.zoom or MIN_ZOOM) * (1.0 + dzl)
-            self.zoom_log = math.max(0, (self.zoom_log or 0) + dzl)
+            self.zoom_log = m_max(0, (self.zoom_log or 0) + dzl)
             if self.zoom >= MAX_ZOOM then
                 self.zoom = MAX_ZOOM; self.zoom_dir = -1
             elseif self.zoom <= MIN_ZOOM then
@@ -158,24 +165,23 @@ function p:render(bands, frame, rows, cols)
     end
 
     -- ── Per-frame constants ──────────────────────────────────────────────────
-    local dyn_max_iter = math.min(MAX_ITER_CAP,
-                             BASE_ITER + math.floor((self.zoom_log or 0) * 20))
+    local dyn_max_iter = m_min(MAX_ITER_CAP,
+                             BASE_ITER + m_floor((self.zoom_log or 0) * 20))
     -- Seven thresholds divide the iteration range into 8 fill-level bands.
-    local t95 = math.floor(dyn_max_iter * 0.95)
-    local t85 = math.floor(dyn_max_iter * 0.85)
-    local t65 = math.floor(dyn_max_iter * 0.65)
-    local t40 = math.floor(dyn_max_iter * 0.40)
-    local t20 = math.floor(dyn_max_iter * 0.20)
-    local t10 = math.floor(dyn_max_iter * 0.10)
-    local t04 = math.floor(dyn_max_iter * 0.04)
+    local t95 = m_floor(dyn_max_iter * 0.95)
+    local t85 = m_floor(dyn_max_iter * 0.85)
+    local t65 = m_floor(dyn_max_iter * 0.65)
+    local t40 = m_floor(dyn_max_iter * 0.40)
+    local t20 = m_floor(dyn_max_iter * 0.20)
+    local t10 = m_floor(dyn_max_iter * 0.10)
+    local t04 = m_floor(dyn_max_iter * 0.04)
 
-    local bass    = math.max(bands[1] or 0, bands[2] or 0)
-    local coffset = (math.floor(self.color_phase or 0)
-                     + math.floor(bass * BASS_COLOR_KICK)) % PAL
+    local bass    = m_max(bands[1] or 0, bands[2] or 0)
+    local coffset = (m_floor(self.color_phase or 0)
+                     + m_floor(bass * BASS_COLOR_KICK)) % PAL
     local cidx = coffset + 1
     -- Interior: dim ⣿ normally, bright on bass flash
-    local int_brl    = (bass > BASS_FLASH_THR) and BRAILE_B or BRAILE
-    local interior_cell = int_brl[cidx][255]
+    local int_brl = (bass > BASS_FLASH_THR) and BRAILE_B or BRAILE
 
     local zoom  = self.zoom or MIN_ZOOM
     local cos_t = self.cos_t or 1.0
@@ -183,15 +189,20 @@ function p:render(bands, frame, rows, cols)
     local cx    = self.center_x or TARGETS[1].x
     local cy    = self.center_y or TARGETS[1].y
 
-    -- ── Incremental coordinate setup (demo-scene inner-loop trick) ───────────
+    -- ── Coordinate setup ─────────────────────────────────────────────────────
+    -- Direct multiplication per column (pcr = row_base + c * d_pcr) avoids
+    -- accumulating float rounding errors across a row at deep zoom levels.
+    -- row_base is shifted back by one d_pcr/d_pci step so that c=1 lands on
+    -- the correct first-column coordinate.
     local scale     = 4.0 / (zoom * cols)
     local d_pcr     = scale * cos_t
     local d_pci     = scale * sin_t
     local scale_asp = scale * ASPECT
     local mid_c     = (cols + 1) * 0.5
     local mid_r     = (rows + 1) * 0.5
-    local pcr_base  = cx + (1.0 - mid_c) * d_pcr
-    local pci_base  = cy + (1.0 - mid_c) * d_pci
+    -- Shift base back one column so that (base + c*step) gives col c for c=1..cols
+    local pcr_base  = cx + (0.0 - mid_c) * d_pcr
+    local pci_base  = cy + (0.0 - mid_c) * d_pci
 
     local brl_b = BRAILE_B   -- exterior: always bright
     local fm    = FILL_MASKS
@@ -217,21 +228,26 @@ function p:render(bands, frame, rows, cols)
         local ci = (i + coffset) % pal + 1
         local m  = fm[fill + 1]
         brl_for_iter[i] = (m == 0) and " " or brl_b[ci][m]
-        local md = fm[math.min(fill + 1, 8) + 1]
+        local md = fm[m_min(fill + 1, 8) + 1]
         brl_for_iter_d[i] = (md == 0) and " " or brl_b[ci][md]
     end
 
     local in_set_count = 0
     local out = {}
+    local row_buffer = self.row_buffer  -- reuse across frames; no per-row allocation
 
     for r = 1, rows do
-        local row = {}
         local rdither = r % 2  -- cached for checkerboard: (rdither + c) % 2
-        local dy  = (r - mid_r) * scale_asp
-        local pcr = pcr_base - dy * sin_t
-        local pci = pci_base + dy * cos_t
+        local dy      = (r - mid_r) * scale_asp
+        -- Row base: shift back one step so c*d_pcr lands at the right column.
+        local r_pcr   = pcr_base - dy * sin_t
+        local r_pci   = pci_base + dy * cos_t
 
         for c = 1, cols do
+            -- Direct per-column multiply: no float drift accumulation.
+            local pcr = r_pcr + c * d_pcr
+            local pci = r_pci + c * d_pci
+
             -- ── 1. Cardioid / period-2 bulb pre-check ───────────────────────
             local pci2 = pci * pci
             local q_x  = pcr - 0.25
@@ -292,24 +308,20 @@ function p:render(bands, frame, rows, cols)
                 -- Cells where Brent didn't fire (cardioid/bulb shortcuts, or
                 -- genuinely didn't cycle in time) fall back to the global cidx.
                 local int_cidx = (period > 0) and ((coffset + period) % pal + 1) or cidx
-                row[c] = int_brl[int_cidx][255]
+                row_buffer[c] = int_brl[int_cidx][255]
                 in_set_count = in_set_count + 1
             else
                 -- Checkerboard dither: alternating cells use fill N vs fill N+1.
                 -- At gradient boundaries this blends two densities visually,
                 -- giving ~15 effective levels instead of 8.
                 if (rdither + c) % 2 == 0 then
-                    row[c] = brl_for_iter[iter]
+                    row_buffer[c] = brl_for_iter[iter]
                 else
-                    row[c] = brl_for_iter_d[iter]
+                    row_buffer[c] = brl_for_iter_d[iter]
                 end
             end
-
-            -- ── 5. Advance to next column (2 adds — no multiplications) ─────
-            pcr = pcr + d_pcr
-            pci = pci + d_pci
         end
-        out[r] = table.concat(row)
+        out[r] = table.concat(row_buffer, "", 1, cols)
     end
 
     if not self.resetting and in_set_count >= rows * cols * SOLID_TRIGGER then
