@@ -2,6 +2,8 @@
 
 A psychedelic Mandelbrot set visualizer plugin for [cliamp](https://www.cliamp.stream/), the terminal music player.
 
+![Demo](demo.gif)
+
 ![Screenshot](screenshot.png)
 
 ## Install
