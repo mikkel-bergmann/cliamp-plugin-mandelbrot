@@ -4,6 +4,18 @@ A psychedelic Mandelbrot set visualizer plugin for [cliamp](https://www.cliamp.s
 
 ![Screenshot](screenshot.png)
 
+## Install
+
+```bash
+cliamp plugins install mikkel-bergmann/cliamp-mandelbrot
+```
+
+Start `cliamp` and press `v` to cycle through the visualizers until `Mandelbrot` appears.
+
+```sh
+cliamp plugins remove mandelbrot
+```
+
 ## Features
 
 - **Continuous zoom** into four classic Mandelbrot locations (Sea Horse Valley, Elephant Valley, Seahorse spiral arm, Antenna mini-brot), cycling automatically when the interior fills the screen
@@ -14,16 +26,6 @@ A psychedelic Mandelbrot set visualizer plugin for [cliamp](https://www.cliamp.s
 - **Period-coloured interior** — Brent cycle detection captures the orbit period of each interior point; main cardioid, period-2 bulb, period-4 spirals etc. each get a distinct cycling hue
 - **30-colour psychedelic palette** — ANSI 256-colour cycling through red → orange → yellow → green → cyan → blue → magenta and back
 - **Silence detection** — animation freezes when no audio is playing and resumes instantly
-
-## Installation
-
-Copy `mandelbrot.lua` to your cliamp plugins directory:
-
-```bash
-cp mandelbrot.lua ~/.config/cliamp/plugins/
-```
-
-Then launch cliamp and press `v` to cycle to the Mandelbrot visualizer.
 
 ## Performance
 
