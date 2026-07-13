@@ -234,7 +234,9 @@ function p:render(bands, frame, rows, cols)
 
     local in_set_count = 0
     local out = {}
-    local row_buffer = self.row_buffer  -- reuse across frames; no per-row allocation
+    -- Lazy-init row_buffer in case init() wasn't called before render().
+    if not self.row_buffer then self.row_buffer = {} end
+    local row_buffer = self.row_buffer
 
     for r = 1, rows do
         local rdither = r % 2  -- cached for checkerboard: (rdither + c) % 2
