@@ -4,7 +4,6 @@
 -- Renders entirely in Unicode braille (U+2800–U+28FF).
 -- Each cell's escape-time iteration count maps to a fill level (0–8 dots):
 -- empty far exterior → sparse dots → dense dots near boundary → full ⣿ interior.
--- This gives smooth halftone anti-aliasing with zero extra computation.
 --
 -- Performance stack:
 --   1. Cardioid/period-2 bulb pre-check — skips iteration for provably in-set points
@@ -12,6 +11,11 @@
 --   3. Two-phase Brent cycle detection  — interior exits early, exterior exits fast
 --   4. Precomputed braille strings      — zero hot-path allocation (30×256 at init)
 --   5. Reused row buffer               — no per-row table allocation; less GC pressure
+--   6. Geometry cache                  — iter/period grid reused across frames; only
+--                                        recomputed when zoom drifts >1.5% or every
+--                                        MAX_CACHE_FRAMES frames. Color (coffset) is
+--                                        reapplied every frame from the cached grid,
+--                                        so music reactivity is never stale.
 
 local p = plugin.register({ name = "Mandelbrot", type = "visualizer" })
 
@@ -43,6 +47,11 @@ local ASPECT          = 2.0
 local SILENCE_THRESH  = 0.02
 local IDLE_AFTER      = 20
 local SOLID_TRIGGER   = 0.99
+-- Geometry cache: recompute Mandelbrot grid only when zoom drifts by this
+-- fraction, or when MAX_CACHE_FRAMES is reached. Color is re-applied every
+-- frame so music reactivity is instant regardless of cache state.
+local GEOM_THRESHOLD   = 0.015   -- 1.5% zoom change triggers recompute
+local MAX_CACHE_FRAMES = 8       -- force recompute at least every N frames
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local ESC   = string.char(27)
@@ -112,6 +121,14 @@ function p:init()
     self.center_y      = TARGETS[1].y
     self.resetting     = false
     self.row_buffer    = {}   -- reused every frame to avoid per-row allocation
+    -- Geometry cache: flat arrays indexed (r-1)*cols + c
+    self.iter_grid     = {}   -- raw iteration counts per cell
+    self.period_grid   = {}   -- Brent period estimates per cell
+    self.grid_zoom     = 0    -- zoom at last recompute (0 = invalid/never)
+    self.grid_rows     = 0
+    self.grid_cols     = 0
+    self.grid_max_iter = 0
+    self.cache_age     = MAX_CACHE_FRAMES  -- force recompute on first frame
 end
 
 function p:render(bands, frame, rows, cols)
@@ -167,7 +184,6 @@ function p:render(bands, frame, rows, cols)
     -- ── Per-frame constants ──────────────────────────────────────────────────
     local dyn_max_iter = m_min(MAX_ITER_CAP,
                              BASE_ITER + m_floor((self.zoom_log or 0) * 20))
-    -- Seven thresholds divide the iteration range into 8 fill-level bands.
     local t95 = m_floor(dyn_max_iter * 0.95)
     local t85 = m_floor(dyn_max_iter * 0.85)
     local t65 = m_floor(dyn_max_iter * 0.65)
@@ -179,8 +195,7 @@ function p:render(bands, frame, rows, cols)
     local bass    = m_max(bands[1] or 0, bands[2] or 0)
     local coffset = (m_floor(self.color_phase or 0)
                      + m_floor(bass * BASS_COLOR_KICK)) % PAL
-    local cidx = coffset + 1
-    -- Interior: dim ⣿ normally, bright on bass flash
+    local cidx  = coffset + 1
     local int_brl = (bass > BASS_FLASH_THR) and BRAILE_B or BRAILE
 
     local zoom  = self.zoom or MIN_ZOOM
@@ -189,32 +204,49 @@ function p:render(bands, frame, rows, cols)
     local cx    = self.center_x or TARGETS[1].x
     local cy    = self.center_y or TARGETS[1].y
 
+    -- ── Geometry cache decision ───────────────────────────────────────────────
+    -- Recompute the iter/period grid only when the view has changed enough to
+    -- matter visually. Color (coffset) is derived from music and always fresh.
+    local cache_age  = (self.cache_age or MAX_CACHE_FRAMES) + 1
+    local grid_zoom  = self.grid_zoom or 0
+    local zoom_ratio = (grid_zoom > 0) and (zoom / grid_zoom) or 0
+    local needs_recompute = (
+        self.grid_rows     ~= rows          or
+        self.grid_cols     ~= cols          or
+        self.grid_max_iter ~= dyn_max_iter  or
+        cache_age          >= MAX_CACHE_FRAMES or
+        zoom_ratio         <  (1 - GEOM_THRESHOLD) or
+        zoom_ratio         >  (1 + GEOM_THRESHOLD)
+    )
+    if needs_recompute then
+        self.grid_zoom     = zoom
+        self.grid_rows     = rows
+        self.grid_cols     = cols
+        self.grid_max_iter = dyn_max_iter
+        self.cache_age     = 0
+    else
+        self.cache_age     = cache_age
+    end
+
     -- ── Coordinate setup ─────────────────────────────────────────────────────
-    -- Direct multiplication per column (pcr = row_base + c * d_pcr) avoids
-    -- accumulating float rounding errors across a row at deep zoom levels.
-    -- row_base is shifted back by one d_pcr/d_pci step so that c=1 lands on
-    -- the correct first-column coordinate.
     local scale     = 4.0 / (zoom * cols)
     local d_pcr     = scale * cos_t
     local d_pci     = scale * sin_t
     local scale_asp = scale * ASPECT
     local mid_c     = (cols + 1) * 0.5
     local mid_r     = (rows + 1) * 0.5
-    -- Shift base back one column so that (base + c*step) gives col c for c=1..cols
     local pcr_base  = cx + (0.0 - mid_c) * d_pcr
     local pci_base  = cy + (0.0 - mid_c) * d_pci
 
-    local brl_b = BRAILE_B   -- exterior: always bright
+    local brl_b = BRAILE_B
     local fm    = FILL_MASKS
     local pal   = PAL
 
-    -- Per-frame exterior lookup: iter → precomputed braille string.
-    -- Collapses the 7-comparison fill-level test + modulo + 2 table lookups
-    -- into a single indexed read on the hot path.
-    -- Two tables support checkerboard dithering between fill N and fill N+1,
-    -- doubling effective density levels from 8 to 15 with no extra iteration cost.
-    local brl_for_iter   = {}   -- base fill level
-    local brl_for_iter_d = {}   -- dithered: fill level + 1 (capped at 8)
+    -- Per-frame color lookup: iter → precomputed braille string for current coffset.
+    -- Rebuilt every frame (cheap: ~128 iterations) so music color is always live
+    -- even when geometry is served from cache.
+    local brl_for_iter   = {}
+    local brl_for_iter_d = {}
     for i = 0, dyn_max_iter - 1 do
         local fill
         if     i > t95 then fill = 7
@@ -234,88 +266,91 @@ function p:render(bands, frame, rows, cols)
 
     local in_set_count = 0
     local out = {}
-    -- Lazy-init row_buffer in case init() wasn't called before render().
-    if not self.row_buffer then self.row_buffer = {} end
-    local row_buffer = self.row_buffer
+    if not self.row_buffer  then self.row_buffer  = {} end
+    if not self.iter_grid   then self.iter_grid   = {} end
+    if not self.period_grid then self.period_grid = {} end
+    local row_buffer  = self.row_buffer
+    local iter_grid   = self.iter_grid
+    local period_grid = self.period_grid
 
     for r = 1, rows do
-        local rdither = r % 2  -- cached for checkerboard: (rdither + c) % 2
+        local rdither = r % 2
         local dy      = (r - mid_r) * scale_asp
-        -- Row base: shift back one step so c*d_pcr lands at the right column.
         local r_pcr   = pcr_base - dy * sin_t
         local r_pci   = pci_base + dy * cos_t
+        local base_idx = (r - 1) * cols  -- flat-array row offset
 
         for c = 1, cols do
-            -- Direct per-column multiply: no float drift accumulation.
-            local pcr = r_pcr + c * d_pcr
-            local pci = r_pci + c * d_pci
+            local iter, period
+            local idx = base_idx + c
 
-            -- ── 1. Cardioid / period-2 bulb pre-check ───────────────────────
-            local pci2 = pci * pci
-            local q_x  = pcr - 0.25
-            local q    = q_x * q_x + pci2
-            local iter = dyn_max_iter
-            local period = 0  -- Brent cycle-length estimate; 0 = not detected
+            if needs_recompute then
+                -- ── Full Mandelbrot computation ──────────────────────────────
+                local pcr = r_pcr + c * d_pcr
+                local pci = r_pci + c * d_pci
 
-            if not (q * (q + q_x) < 0.25 * pci2) then
-                local p1 = pcr + 1.0
-                if not (p1 * p1 + pci2 < 0.0625) then
+                local pci2 = pci * pci
+                local q_x  = pcr - 0.25
+                local q    = q_x * q_x + pci2
+                iter   = dyn_max_iter
+                period = 0
 
-                    -- ── 2. Phase 1: 20 fast iterations, zero Brent overhead ─
-                    local zr, zi   = 0.0, 0.0
-                    local zr2, zi2 = 0.0, 0.0
-                    iter = 0
-                    while iter < 20 and zr2 + zi2 < 4.0 do
-                        zi   = 2.0 * zr * zi + pci
-                        zr   = zr2 - zi2 + pcr
-                        zr2  = zr * zr
-                        zi2  = zi * zi
-                        iter = iter + 1
-                    end
+                if not (q * (q + q_x) < 0.25 * pci2) then
+                    local p1 = pcr + 1.0
+                    if not (p1 * p1 + pci2 < 0.0625) then
 
-                    -- ── 3. Phase 2: Brent cycle detection ───────────────────
-                    if iter == 20 and zr2 + zi2 < 4.0 then
-                        local bz_r, bz_i = zr, zi
-                        local bmax, blen = 2, 0
-                        while iter < dyn_max_iter and zr2 + zi2 < 4.0 do
+                        local zr, zi   = 0.0, 0.0
+                        local zr2, zi2 = 0.0, 0.0
+                        iter = 0
+                        while iter < 20 and zr2 + zi2 < 4.0 do
                             zi   = 2.0 * zr * zi + pci
                             zr   = zr2 - zi2 + pcr
                             zr2  = zr * zr
                             zi2  = zi * zi
                             iter = iter + 1
-                            blen = blen + 1
-                            if blen == bmax then
-                                bz_r = zr; bz_i = zi; bmax = bmax + bmax; blen = 0
-                            else
-                                local dr = zr - bz_r
-                                local di = zi - bz_i
-                                if dr*dr + di*di < 1e-12 then
-                                    period = bmax  -- orbit period ≈ bmax
-                                    iter = dyn_max_iter; break
+                        end
+
+                        if iter == 20 and zr2 + zi2 < 4.0 then
+                            local bz_r, bz_i = zr, zi
+                            local bmax, blen = 2, 0
+                            while iter < dyn_max_iter and zr2 + zi2 < 4.0 do
+                                zi   = 2.0 * zr * zi + pci
+                                zr   = zr2 - zi2 + pcr
+                                zr2  = zr * zr
+                                zi2  = zi * zi
+                                iter = iter + 1
+                                blen = blen + 1
+                                if blen == bmax then
+                                    bz_r = zr; bz_i = zi; bmax = bmax + bmax; blen = 0
+                                else
+                                    local dr = zr - bz_r
+                                    local di = zi - bz_i
+                                    if dr*dr + di*di < 1e-12 then
+                                        period = bmax
+                                        iter = dyn_max_iter; break
+                                    end
                                 end
                             end
                         end
+
                     end
+                end
 
-                end  -- bulb check
-            end      -- cardioid check
+                -- Store in cache
+                iter_grid[idx]   = iter
+                period_grid[idx] = period
+            else
+                -- ── Read from geometry cache ─────────────────────────────────
+                iter   = iter_grid[idx]
+                period = period_grid[idx]
+            end
 
-            -- ── 4. Map iter → braille fill level ────────────────────────────
-            -- iter == dyn_max_iter → interior (all dots, dim)
-            -- iter close to max    → many dots (dense near boundary)
-            -- iter near zero       → empty (sparse far exterior)
+            -- ── Map iter → output (always, every frame) ──────────────────────
             if iter >= dyn_max_iter then
-                -- Color interior by orbit period: main cardioid, period-2 bulb,
-                -- period-4 mini-brot etc. each get a distinct cycling hue.
-                -- Cells where Brent didn't fire (cardioid/bulb shortcuts, or
-                -- genuinely didn't cycle in time) fall back to the global cidx.
                 local int_cidx = (period > 0) and ((coffset + period) % pal + 1) or cidx
                 row_buffer[c] = int_brl[int_cidx][255]
-                in_set_count = in_set_count + 1
+                in_set_count  = in_set_count + 1
             else
-                -- Checkerboard dither: alternating cells use fill N vs fill N+1.
-                -- At gradient boundaries this blends two densities visually,
-                -- giving ~15 effective levels instead of 8.
                 if (rdither + c) % 2 == 0 then
                     row_buffer[c] = brl_for_iter[iter]
                 else
