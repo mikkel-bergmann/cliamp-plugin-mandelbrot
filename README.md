@@ -9,7 +9,7 @@ A psychedelic Mandelbrot set visualizer plugin for [cliamp](https://www.cliamp.s
 ## Install
 
 ```bash
-cliamp plugins install mikkel-bergmann/cliamp-mandelbrot
+cliamp plugins install mikkel-bergmann/cliamp-plugin-mandelbrot
 ```
 
 Start `cliamp` and press `v` to cycle through the visualizers until `Mandelbrot` appears.
